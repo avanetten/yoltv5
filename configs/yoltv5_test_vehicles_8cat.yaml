@@ -1,0 +1,56 @@
+######################################
+# Set variables
+######################################
+
+###################
+# yoltv5 input file variables
+yoltv5_path: /opt/src/yoltv5
+# object name variables (object names should be in order)
+name_file_name: 'yoltv5_8class.name'
+object_names: 	
+	- 'Small_Aircraft'
+	- 'Large_Aircraft'
+	- 'Car'
+	- 'Bus'
+	- 'Truck'
+	- 'Boat'
+	- 'Medium_Ship'
+	- 'Large_Ship'
+###################
+# image slicing variables
+data_root: /data/test_imagery
+test_im_dir: /data/test_imagery/input
+sliceHeight: 544
+sliceWidth: 544
+slice_overlap: 0.1
+im_ext: '.tif'
+out_ext: '.jpg'
+# shouldn't need changed below here
+skip_highly_overlapped_tiles: False
+slice_verbose: False
+n_threads_slice: 8
+slice_sep: '__'
+slice_overwrite: False
+outdir_slice_root: /data/test_imagery/yoltv5
+outdir_slice_ims: /data/test_imagery/images_slice
+outdir_slice_txt: /data/test_imagery/txt
+outpath_test_txt: /data/test_imagery/test.txt
+
+###################
+# inference variables
+outname_infer: 'yoltv5_8class_'
+weights_file: /opt/yoltv5/yolv5/yolov5/runs/train/exp/weights/last.pt
+
+###################
+# post-process variables
+detection_threshes:
+	- 0.25
+n_plots: 4
+allow_nested_detections: True
+truth_file: '' # os.path.join(data_root, 'test', 'geojsons_geo', 'truth.geojson')
+# seldom changed below here
+extract_chips: False
+chip_rescale_frac: 1.1
+chip_ext: '.jpg'
+edge_buffer_test: 1
+max_bbox_size: 100
