@@ -1541,6 +1541,11 @@ def execute(pred_dir='/root/yoltv5/results/',
             gdf_pix = gpd.GeoDataFrame(geom_list_pix, columns=['geometry', 'category', 'prob'], crs=crs)
             gdf_pix.to_file(outfile_geojson_pix, driver='GeoJSON')
             gdf_geo = gpd.GeoDataFrame(geom_list_geo, columns=['geometry', 'category', 'prob'], crs=crs)
+            # add pix coords to geo gdf as well
+            gdf_geo['x0_pix'] = df_filt['Xmin_Glob'].values
+            gdf_geo['x1_pix'] = df_filt['Xmax_Glob'].values
+            gdf_geo['y0_pix'] = df_filt['Ymin_Glob'].values
+            gdf_geo['y1_pix'] = df_filt['Ymax_Glob'].values
             gdf_geo.to_file(outfile_geojson_geo_orig_crs, driver='GeoJSON')
             # convert geojson to 'EPSG:3857'
             # https://geopandas.org/en/stable/docs/user_guide/projections.html
