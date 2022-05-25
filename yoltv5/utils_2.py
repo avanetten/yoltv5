@@ -1,61 +1,46 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Oct 15 2020
-@author: avanetten
-"""
-
-import os
-import sys
-
 import math
-import shutil
-import rasterio
-import rasterio.mask
-import pandas as pd
-import numpy as np
-import skimage
 import multiprocessing
-import skimage.io
-import skimage.transform
-from rasterio.windows import Window
-import fiona
+import os
 import random
-import cv2
-# import solaris.vector
-import shapely
-import matplotlib
-from matplotlib.collections import PolyCollection
-import matplotlib.pyplot as plt
-from shapely.wkt import loads
-from affine import Affine
-import rasterio
-from rasterio.warp import transform_bounds
-from rasterio.crs import CRS
-# from ..utils.geo import list_to_affine, _reduce_geom_precision
-# from ..utils.core import _check_gdf_load, _check_crs, _check_rasterio_im_load
-#from ..raster.image import get_geo_transform
-from shapely.geometry import box, Polygon
-import pandas as pd
-import geopandas as gpd
-from rtree.core import RTreeError
+import time
 import shutil
-from shapely.geometry import MultiLineString, MultiPolygon, mapping, box, shape
+import sys
+from subprocess import PIPE, STDOUT, Popen
+
 
 from osgeo import gdal
 from osgeo import ogr
 from osgeo import osr
 
-import argparse
-from tqdm import tqdm
+import cv2
+import fiona
+import geopandas as gpd
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import rasterio
+import rasterio.mask
+# import solaris.vector
+import shapely
+import skimage
+import skimage.io
+import skimage.transform
+from affine import Affine
+from matplotlib.collections import PolyCollection
+from rasterio.crs import CRS
+from rasterio.warp import transform_bounds
+from rasterio.windows import Window
+from rtree.core import RTreeError
+# from ..utils.geo import list_to_affine, _reduce_geom_precision
+# from ..utils.core import _check_gdf_load, _check_crs, _check_rasterio_im_load
+#from ..raster.image import get_geo_transform
+from shapely.geometry import (MultiLineString, MultiPolygon, Polygon, box,
+                              mapping, shape)
+from shapely.wkt import loads
+from statsmodels.stats.weightstats import DescrStatsW
 
-from osgeo import ogr
-from utils_2 import convert_poly_coords, create_mask, convert, map_wrapper
-from tile_utils import slice_im_plus_boxes
-
-# yolt funcs
-import tile_ims_labels
-import utils_2
+from geo import affine_to_list, list_to_affine
 
 ###############################################################################
 ###############################################################################
@@ -96,6 +81,81 @@ def get_geo_transform(raster_src):
 
     return affine_obj
     
+    
+# https://github.com/CosmiQ/solaris/blob/master/solaris/vector/polygon.py
+###############################################################################
+
+def convert_poly_coords(geom, raster_src=None, affine_obj=None, inverse=False,
+                        precision=None):
+    """Georegister geometry objects currently in pixel coords or vice versa.
+    Arguments
+    ---------
+    geom : :class:`shapely.geometry.shape` or str
+        A :class:`shapely.geometry.shape`, or WKT string-formatted geometry
+        object currently in pixel coordinates.
+    raster_src : str, optional
+        Path to a raster image with georeferencing data to apply to `geom`.
+        Alternatively, an opened :class:`rasterio.Band` object or
+        :class:`osgeo.gdal.Dataset` object can be provided. Required if not
+        using `affine_obj`.
+    affine_obj: list or :class:`affine.Affine`
+        An affine transformation to apply to `geom` in the form of an
+        ``[a, b, d, e, xoff, yoff]`` list or an :class:`affine.Affine` object.
+        Required if not using `raster_src`.
+    inverse : bool, optional
+        If true, will perform the inverse affine transformation, going from
+        geospatial coordinates to pixel coordinates.
+    precision : int, optional
+        Decimal precision for the polygon output. If not provided, rounding
+        is skipped.
+    Returns
+    -------
+    out_geom
+        A geometry in the same format as the input with its coordinate system
+        transformed to match the destination object.
+    """
+
+    if not raster_src and not affine_obj:
+        raise ValueError("Either raster_src or affine_obj must be provided.")
+
+    if raster_src is not None:
+        affine_xform = get_geo_transform(raster_src)
+    else:
+        if isinstance(affine_obj, Affine):
+            affine_xform = affine_obj
+        else:
+            # assume it's a list in either gdal or "standard" order
+            # (list_to_affine checks which it is)
+            if len(affine_obj) == 9:  # if it's straight from rasterio
+                affine_obj = affine_obj[0:6]
+            affine_xform = list_to_affine(affine_obj)
+
+    if inverse:  # geo->px transform
+        affine_xform = ~affine_xform
+
+    if isinstance(geom, str):
+        # get the polygon out of the wkt string
+        g = shapely.wkt.loads(geom)
+    elif isinstance(geom, shapely.geometry.base.BaseGeometry):
+        g = geom
+    else:
+        raise TypeError('The provided geometry is not an accepted format. '
+                        'This function can only accept WKT strings and '
+                        'shapely geometries.')
+
+    xformed_g = shapely.affinity.affine_transform(g, [affine_xform.a,
+                                                      affine_xform.b,
+                                                      affine_xform.d,
+                                                      affine_xform.e,
+                                                      affine_xform.xoff,
+                                                      affine_xform.yoff])
+    if isinstance(geom, str):
+        # restore to wkt string format
+        xformed_g = shapely.wkt.dumps(xformed_g)
+    if precision is not None:
+        xformed_g = _reduce_geom_precision(xformed_g, precision=precision)
+
+    return xformed_g
 
 ###############################################################################
 #http://stackoverflow.com/questions/34372480/rotate-point-about-another-point-in-degrees-python
@@ -131,150 +191,6 @@ def create_mask(im_path, label_path, out_path_mask, burnValue=255):
     with rasterio.open(out_path_mask, "w", **out_meta) as dest:
         dest.write(out_image)
     
-
-###############################################################################
-def prep_one(label_path, img_path, 
-             subdir, suff, 
-             out_dir_image, out_dir_label, out_dir_mask,
-             out_path_image, out_path_label, out_path_mask, 
-             sliceHeight=416, sliceWidth=416, mask_burnValue=255, 
-             cls_id=0,
-             verbose=True):
-
-        classes = []
-            
-                
-        # ##################
-        # # Image
-        # ##################
-
-        im_tmp = skimage.io.imread(img_path)
-        h, w = im_tmp.shape[:2]
-        aspect_ratio = 1.0 * h / w
-        dx = np.abs(h - w)
-        max_dx = 3
-
-        ##################
-        # Labels
-        ##################
-        
-        if label_path:
-            with fiona.open(label_path, "r") as annotation_collection:
-                polygons = [feature["geometry"] for feature in annotation_collection]
-                properties = [feature["properties"] for feature in annotation_collection]
-
-
-            # get pixel coords of bounding boxes
-            boxes, dhs = [], []
-            for poly in polygons:
-                geom = shapely.geometry.Polygon(poly['coordinates'][0])
-                pixel_geom = convert_poly_coords(geom, raster_src=img_path, 
-                                                 affine_obj=None, inverse=True,
-                                                 precision=2)
-                # Get bounding box. object.bounds:  Returns a (minx, miny, maxx, maxy) tuple.
-                minx, miny, maxx, maxy = pixel_geom.bounds
-                boxes.append([minx, miny, maxx, maxy])
-                dhs.append([maxy-miny])
-            #get classes
-            for property in properties:
-                cls_id = int(property['role_id'])-1
-                classes.append(cls_id)
-        else:
-            classes, boxes = [], []
-                   
-        ##################
-        # Process data
-        ##################
-
-        # create masks
-        if out_path_mask and (not os.path.exists(out_path_mask)):
-            create_mask(img_path, label_path, out_path_mask,
-                        burnValue=mask_burnValue)
-                            
-        # tile data, if needed
-        if suff == '_tile':
-            # tile image, labels, and mask
-            out_name = subdir + '_PS-RGB'
-            # tile (also creates labels)
-            # for training, skip highly overlapped edge tiles
-            skip_highly_overlapped_tiles=True
-            tile_ims_labels.slice_im_plus_boxes(
-                img_path, out_name, out_dir_image,
-                boxes=boxes, yolo_classes=classes, out_dir_labels=out_dir_label,
-                mask_path=out_path_mask, out_dir_masks=out_dir_mask,
-                sliceHeight=sliceHeight, sliceWidth=sliceWidth,
-                overlap=0.1, slice_sep='|',
-                skip_highly_overlapped_tiles=skip_highly_overlapped_tiles,
-                out_ext='.png', verbose=False)
-        
-        else:
-            # no tiling
-            # first let's process images, then later we'll make labels
-            
-            # simply copy to dest folder if object is yuge
-            if suff == '_yuge':
-                shutil.copyfile(img_path, out_path_image)
-                hfinal, wfinal = h, w
-            
-            # simply copy to dest folder if aspect ratio is reasonable
-            elif (0.9 < aspect_ratio < 1.1):
-                shutil.copyfile(img_path, out_path_image)
-                hfinal, wfinal = h, w
-                
-            # else let's add a border on right or bottom,
-            #  (which doesn't affect pixel coords of labels).
-            else:
-                topBorderWidth, bottomBorderWidth, leftBorderWidth, rightBorderWidth = 0, 0, 0, 0
-                if h / w > 1.1:
-                    rightBorderWidth = np.abs(h - w)
-                if h / w < 0.9:
-                    bottomBorderWidth = np.abs(h - w)
-                # add border to image
-                # im_tmp = cv2.imread(out_path_image, 1) # make everything 3-channel?
-                outputImage = cv2.copyMakeBorder(
-                             im_tmp,
-                             topBorderWidth,
-                             bottomBorderWidth,
-                             leftBorderWidth,
-                             rightBorderWidth,
-                             cv2.BORDER_CONSTANT,
-                             value=0)
-                skimage.io.imsave(out_path_image, outputImage)
-                # cv2.imwrite(out_path_image, outputImage)
-                hfinal, wfinal = outputImage.shape[:2]
-                
-                if out_path_mask:
-                    # add border to mask
-                    im_tmp2 = skimage.io.imread(out_path_mask)
-                    #im2 = cv2.imread(out_path_mask, 0)
-                    outputImage2 = cv2.copyMakeBorder(
-                                 im_tmp2,
-                                 topBorderWidth,
-                                 bottomBorderWidth,
-                                 leftBorderWidth,
-                                 rightBorderWidth,
-                                 cv2.BORDER_CONSTANT,
-                                 value=0)
-                    skimage.io.imsave(out_path_mask, outputImage2)
-                    # cv2.imwrite(out_path_mask, outputImage2)
-
-            # make yolo labels
-            if out_path_label:
-                txt_outfile = open(out_path_label, "w")
-                # create yolo style labels
-                for class_tmp,box_tmp in zip(classes, boxes):
-                    minx, miny, maxx, maxy = box_tmp
-                    bb = utils_2.convert((wfinal, hfinal), [minx, maxx, miny, maxy])
-                    # (xb,yb,wb,hb) = bb
-                    if (np.min(bb) < 0) or (np.max(bb) > 1):
-                        print("  yolo coords:", bb)
-                        raise ValueError("  coords outside bounds, breaking!")
-                    outstring = str(class_tmp) + " " + " ".join([str(a) for a in bb]) + '\n'
-                    if verbose: 
-                        print("  outstring:", outstring.strip())
-                    txt_outfile.write(outstring)
-                txt_outfile.close()
-
 
 ###############################################################################
 def win_jitter(window_size, jitter_frac=0.1):
@@ -606,7 +522,7 @@ def plot_training_bboxes(label_folder, image_folder, ignore_augment=True,
             cat_int = int(yolt_box[0])
             color = colors[cat_int]
             yb = yolt_box[1:]
-            box0 = utils_2.convert_reverse(shape, yb)
+            box0 = convert_reverse(shape, yb)
             # convert to int
             box1 = [int(round(b, 2)) for b in box0]
             [xmin, xmax, ymin, ymax] = box1
@@ -655,9 +571,9 @@ def plot_training_bboxes(label_folder, image_folder, ignore_augment=True,
                 0.75*ydiff)), (0, 0, 0), label_font_width)
 
             # title
-            title = str(cat_int)
-            title_pos = (border[0], int(border[0]*0.66))
-            cv2.putText(img_mpl, title, title_pos, font, 1.7*font_size, (0,0,0), label_font_width, cv2.CV_AA)#, cv2.LINE_AA)
+            # title = figname.split('/')[-1].split('_')[0] + ':  Plot Threshold = ' + str(plot_thresh) # + ': thresh=' + str(plot_thresh)
+            #title_pos = (border[0], int(border[0]*0.66))
+            # cv2.putText(img_mpl, title, title_pos, font, 1.7*font_size, (0,0,0), label_font_width, cv2.CV_AA)#, cv2.LINE_AA)
             # cv2.putText(img_mpl, title, title_pos, font, 1.7*font_size, (0,0,0), label_font_width,  cv2.CV_AA)#cv2.LINE_AA)
 
         if show_plot:
@@ -1038,7 +954,7 @@ def yolt_from_df(im_path, df_polys,
             yolt_coords = []
             for row in obj_list:
                 [index_nest, cat_nest, x0, y0, x1, y1] = row
-                yolt_row = [cat_nest] + list(utils_2.convert((w,h), [x0,x1,y0,y1]))
+                yolt_row = [cat_nest] + list(convert((w,h), [x0,x1,y0,y1]))
                 # cat_idx = cat_idx_dic[cat_nest]
                 # yolt_row = [cat_idx, cat_nest] + list(convert.convert((w,h), [x0,x1,y0,y1]))
                 yolt_coords.append(yolt_row)
@@ -1136,7 +1052,7 @@ def yolt_from_df(im_path, df_polys,
                 yolt_coords = []
                 for row in obj_list:
                     [index_nest, cat_nest, x0, y0, x1, y1] = row
-                    yolt_row = [cat_nest] + list(utils_2.convert((w,h), [x0,x1,y0,y1]))
+                    yolt_row = [cat_nest] + list(convert((w,h), [x0,x1,y0,y1]))
                     # cat_idx = cat_idx_dic[cat_nest]
                     # yolt_row = [cat_idx, cat_nest] + list(convert.convert((w,h), [x0,x1,y0,y1]))
                     yolt_coords.append(yolt_row)
@@ -1411,7 +1327,7 @@ def yolt_from_visdrone(im_path, label_path,
             yolt_coords = []
             for row in obj_list:
                 [index_nest, cat_nest, x0, y0, x1, y1] = row
-                yolt_row = [cat_nest] + list(utils_2.convert((w,h), [x0,x1,y0,y1]))
+                yolt_row = [cat_nest] + list(convert((w,h), [x0,x1,y0,y1]))
                 # cat_idx = cat_idx_dic[cat_nest]
                 # yolt_row = [cat_idx, cat_nest] + list(convert.convert((w,h), [x0,x1,y0,y1]))
                 yolt_coords.append(yolt_row)
@@ -1590,7 +1506,7 @@ def yolt_from_df_v0(im_path, df_polys,
             yolt_coords = []
             for row in obj_list:
                 [index_nest, cat_nest, x0, y0, x1, y1] = row
-                yolt_row = [cat_nest] + list(utils_2.convert((w,h), [x0,x1,y0,y1]))
+                yolt_row = [cat_nest] + list(convert((w,h), [x0,x1,y0,y1]))
                 # cat_idx = cat_idx_dic[cat_nest]
                 # yolt_row = [cat_idx, cat_nest] + list(convert.utils.convert((w,h), [x0,x1,y0,y1]))
                 yolt_coords.append(yolt_row)
@@ -1743,251 +1659,458 @@ def get_labels(csv_path, xmin, ymin, width, height, label_col, min_overlap=0, cl
             labels = len(tile_gdf)
 
         return geom_bounds, labels, kept_inds
-        
+
 
 ###############################################################################
+def map_wrapper(x):
+    '''For multi-threading'''
+    return x[0](*(x[1:]))
+
+
 ###############################################################################
-def main():    
+def weighted_avg_and_std(values, weights):
+    """
+    Return the weighted average and standard deviation.
+    values, weights -- Numpy ndarrays with the same shape.
+    """
 
-    verbose = True
-    mask_burnValue = 255
-    sliceHeight, sliceWidth = 416, 416
-    cls_id = 0
-    valid_freq_iter = 6  # 6 corresponds to 1/6 of the data for validation
-    n_threads = 8
+    weighted_stats = DescrStatsW(values, weights=weights, ddof=0)
 
-    # data directory 
-    data_dir = 'data/'
-    data_dir_train = os.path.join(data_dir, 'train/RarePlanes_train_PS-RGB_tiled/PS-RGB_tiled/')
+    # weighted mean of data (equivalent to np.average(array, weights=weights))
+    mean = weighted_stats.mean
+    # standard deviation with default degrees of freedom correction
+    std = weighted_stats.std
+    # variance with default degrees of freedom correction
+    var = weighted_stats.var
 
-    # output dirs
-    out_dir_root = 'wdata/'
-    # out_dir_root = os.path.join(data_dir, 'data_yolov5_2')
-    # make dirs
-    for d in [out_dir_root]:
-        os.makedirs(d, exist_ok=True)
+    return (mean, std, var)
 
-    # iterate through data, create masks, pngs, and labels
-    subdirs = sorted(os.listdir(data_dir_train))
-    shape_list = []
-    input_args = []
-    list_of_files = []
+def slice_im_plus_boxes(image_path, out_name, out_dir_images, 
+             boxes=[], yolo_classes=[], out_dir_labels=None, 
+             mask_path=None, out_dir_masks=None,
+             sliceHeight=416, sliceWidth=416,
+             overlap=0.1, slice_sep='|', pad=0,
+             skip_highly_overlapped_tiles=False,
+             overwrite=False,
+             out_ext='.png', verbose=False):
 
-    for i,subdir in enumerate(subdirs):
-        # if i > 200:
-        #     break
-        print("\n")
-        print(i, "/", len(subdirs), subdir)
-        suff = ''
+    """
+    Slice a large image into smaller windows, and also bin boxes
+    Adapted from:
+         https://github.com/avanetten/simrdwn/blob/master/simrdwn/core/slice_im.py
 
-        ##################
-        # Data Locs 
-        ##################
-        file_base = subdir.rsplit('.', -1)[0]
-        file_ext = subdir.rsplit('.', -1)[1]
-        subdir = subdir.rsplit('.', -1)[0]
-        
+    Arguments
+    ---------
+    image_path : str
+        Location of image to slice
+    out_name : str
+        Root name of output files (coordinates will be appended to this)
+    out_dir_images : str
+        Output directory for images
+	boxes : arr
+		List of bounding boxes in image, in pixel coords
+        [ [xb0, yb0, xb1, yb1], ...]
+        Defaults to []
+    yolo_classes : list
+        list of class of objects for each box [0, 1, 0, ...]
+        Defaults to []
+    out_dir_labels : str
+        Output directory for labels
+        Defaults to None
+    sliceHeight : int
+        Height of each slice.  Defaults to ``416``.
+    sliceWidth : int
+        Width of each slice.  Defaults to ``416``.
+    overlap : float
+        Fractional overlap of each window (e.g. an overlap of 0.2 for a window
+        of size 256 yields an overlap of 51 pixels).
+        Default to ``0.1``.
+    slice_sep : str
+        Character used to separate outname from coordinates in the saved
+        windows.  Defaults to ``|``
+    out_ext : str
+        Extension of saved images.  Defaults to ``.png``.
+    verbose : boolean
+        Switch to print relevant values to screen.  Defaults to ``False``
 
-        #Check for duplicates
+    Returns
+    -------
+    None
+    """
 
-        if file_base in list_of_files:
-            continue
-        else:
-            list_of_files.append(file_base)
+    if len(out_ext) == 0:
+        im_ext = '.' + image_path.split('.')[-1]
+    else:
+        im_ext = out_ext
 
-        print(file_base)
-        print(file_ext)
+    t0 = time.time()
+    image = skimage.io.imread(image_path)  #, as_grey=False).astype(np.uint8)  # [::-1]
+    print("image.shape:", image.shape)
+    if mask_path:
+        mask = skimage.io.imread(mask_path)
+    win_h, win_w = image.shape[:2]
+    win_size = sliceHeight*sliceWidth
+    dx = int((1. - overlap) * sliceWidth)
+    dy = int((1. - overlap) * sliceHeight)
+    
+    n_ims = 0
+    for y0 in range(0, image.shape[0], dy):
+        for x0 in range(0, image.shape[1], dx):
+            out_boxes_yolo = []
+            out_classes_yolo = []
+            n_ims += 1
 
-        if file_ext == 'xml':
-            continue
+            if (n_ims % 100) == 0:
+                print(n_ims)
 
-        label_path = os.path.join(data_dir_train + file_base + '.geojson')
-        img_path = os.path.join(data_dir_train+file_base + '.png')
+            # make sure we don't have a tiny image on the edge
+            if y0+sliceHeight > image.shape[0]:
+                # skip if too much overlap (> 0.6)
+                if skip_highly_overlapped_tiles:
+                    if (y0+sliceHeight - image.shape[0]) > (0.6*sliceHeight):
+                        continue
+                    else:
+                        y = image.shape[0] - sliceHeight
+                else:
+                    y = image.shape[0] - sliceHeight
+            else:
+                y = y0
+            if x0+sliceWidth > image.shape[1]:
+                # skip if too much overlap (> 0.6)
+                if skip_highly_overlapped_tiles:
+                    if (x0+sliceWidth - image.shape[1]) > (0.6*sliceWidth):
+                        continue
+                    else:
+                        x = image.shape[1] - sliceWidth
+                else:
+                    x = image.shape[1] - sliceWidth
+            else:
+                x = x0
 
-        print(label_path)
-        print(img_path)
+            xmin, xmax, ymin, ymax = x, x+sliceWidth, y, y+sliceHeight
 
-        out_dir_tiff = os.path.join(out_dir_root, 'train')
-        os.makedirs(out_dir_tiff, exist_ok=True)
-                   
-        ##################
-        # Image
-        ##################
-        
-        im_tmp = skimage.io.imread(img_path) #  (assume pan is the same size as ps-rgb will be!)
-        # im_tmp = skimage.io.imread(ps_rgb_path)
-        h, w = im_tmp.shape[:2]
-        shape_list.append([subdir, h, w])
-        # im_tmp = skimage.io.imread(pan_path)
-        # h, w = im_tmp.shape
-        # shape_list.append([subdir + '_PAN', h, w])
-        aspect_ratio = 1.0 * h / w
-        dx = np.abs(h - w)
-        max_dx = 3
-
-        ##################
-        # Labels
-        ##################
-        
-        with fiona.open(label_path, "r") as annotation_collection:
-            annotations = [feature["geometry"] for feature in annotation_collection]      
-        if verbose:
-            print("  h, w:", h, w)
-            print("  aspect_ratio:", aspect_ratio)
-            print("  n annotations:", len(annotations))
-                   
-        ##################
-        # Set output paths
-        ##################
-        
-        # put every fifth item in valid
-        if (i % valid_freq_iter) == 0:
-            pop = 'valid'
-        else:
-            pop = 'train'
+            # find boxes that lie entirely within the window
+            if len(boxes) > 0:
+                out_path_label = os.path.join(
+                    out_dir_labels,
+                    out_name + slice_sep + str(y) + '_' + str(x) + '_'
+                    + str(sliceHeight) + '_' + str(sliceWidth)
+                    + '_' + str(pad) + '_' + str(win_w) + '_' + str(win_h)
+                    + '.txt')
+                for j,b in enumerate(boxes):
+                    yolo_class = yolo_classes[j]
+                    xb0, yb0, xb1, yb1 = b
+                    if (xb0 >= xmin) and (yb0 >= ymin) \
+                        and (xb1 <= xmax) and (yb1 <= ymax):
+                        # get box coordinates within window
+                        out_box_tmp = [xb0 - xmin, xb1 - xmin,
+                                       yb0 - ymin, yb1 - ymin]
+                        print("  out_box_tmp:", out_box_tmp)
+                        # out_boxes.append(out_box_tmp)
+                        # convert to yolo coords (x,y,w,h)
+                        yolo_coords = convert((sliceWidth, sliceHeight),
+                                               out_box_tmp)
+                        print("    yolo_coords:", yolo_coords)
+                        out_boxes_yolo.append(yolo_coords)
+                        out_classes_yolo.append(yolo_class)
             
-        # check if it's a huge square image (these all have a large circle centered in the middle,
-        #  so we can skip for training)
-        if (((h >= 600) and (w >= 600) and (dx <= max_dx)) \
-            or ((h >= 1000) and (w >= 1000) and (0.97 < aspect_ratio < 1.03))) \
-            and (len(annotations) == 1):        # skipped in original non-tiling version
-            # or (h * w > 800 * 800):  # original version (no tiling)
-            suff = '_yuge'
-        
-        else:
-            suff = ''
+                # skip if no labels?
+                if len(out_boxes_yolo) == 0:
+                    continue
 
-        # set output folders
-        # out_dir_tiff = os.path.join(out_dir_root, pop, 'PS-RGB' + suff)
-        out_dir_image = os.path.join(out_dir_root, pop, 'images' + suff)
-        out_dir_label = os.path.join(out_dir_root, pop, 'labels' + suff)
-        out_dir_mask = os.path.join(out_dir_root, pop, 'masks' + suff)        
-        for d in [out_dir_image, out_dir_label, out_dir_mask]:
-            os.makedirs(d, exist_ok=True)
-        # output files
-        # ps_rgb_path = os.path.join(out_dir_tiff, subdir + '_PS-RGB.tif')
-        out_path_image = os.path.join(out_dir_image, subdir + '.png')
-        out_path_label = os.path.join(out_dir_label, subdir + '.txt')
-        out_path_mask = os.path.join(out_dir_mask, subdir + '.png')        
+                # save yolo labels
+                txt_outfile = open(out_path_label, "w")     
+                for yolo_class, yolo_coord in zip(out_classes_yolo, out_boxes_yolo):                          
+                    outstring = str(yolo_class) + " " + " ".join([str(a) for a in yolo_coord]) + '\n'
+                    if verbose: 
+                         print("  outstring:", outstring.strip())
+                    txt_outfile.write(outstring)
+                txt_outfile.close()                
 
-        input_args.append([prep_one,
-                label_path, img_path, 
-                subdir, suff, 
-                out_dir_image, out_dir_label, out_dir_mask,
-                out_path_image, out_path_label, out_path_mask,
-                sliceHeight, sliceWidth, mask_burnValue, 
-                cls_id,
-                verbose])
+            # save mask, if desired
+            if mask_path:
+                mask_c = mask[y:y + sliceHeight, x:x + sliceWidth]
+                outpath_mask = os.path.join(
+                    out_dir_masks,
+                    out_name + slice_sep + str(y) + '_' + str(x) + '_'
+                    + str(sliceHeight) + '_' + str(sliceWidth)
+                    + '_' + str(pad) + '_' + str(win_w) + '_' + str(win_h)
+                    + im_ext)
+                skimage.io.imsave(outpath_mask, mask_c, check_contrast=False)
 
-                   
-    ##################
-    # Execute
-    ##################
-    print("len input_args", len(input_args))
-    print("Execute...\n")
-    with multiprocessing.Pool(n_threads) as pool:
-        pool.map(utils_2.map_wrapper, input_args)
-
-
-    ##################
-    # Make final lists
+            # extract image
+            window_c = image[y:y + sliceHeight, x:x + sliceWidth]
+            outpath = os.path.join(
+                out_dir_images,
+                out_name + slice_sep + str(y) + '_' + str(x) + '_'
+                + str(sliceHeight) + '_' + str(sliceWidth)
+                + '_' + str(pad) + '_' + str(win_w) + '_' + str(win_h)
+                + im_ext)
+            if not os.path.exists(outpath):
+                skimage.io.imsave(outpath, window_c, check_contrast=False)
+            elif overwrite:
+                skimage.io.imsave(outpath, window_c, check_contrast=False)
+            else:
+                print("outpath {} exists, skipping".format(outpath))
+                                                                                                 
+    print("Num slices:", n_ims,
+          "sliceHeight", sliceHeight, "sliceWidth", sliceWidth)
+    print("Time to slice", image_path, time.time()-t0, "seconds")
     
-    # save shapes
-    outpath_shapes = os.path.join(out_dir_root, 'shapes_train_valid.csv')  
-    df_shapes = pd.DataFrame(shape_list, columns=['im_name', 'h', 'w'])
-    df_shapes.to_csv(outpath_shapes)
-
-    #################
-    # lists of images
-    
-    # normal train images
-    dtmp = os.path.join(out_dir_root, 'train', 'images' + '')
-    im_list_train = []
-    for f in sorted([z for z in os.listdir(dtmp) if z.endswith('.png')]):
-        im_list_train.append(os.path.join(dtmp, f))
-    # # tile train images
-    # dtmp = os.path.join(out_dir_root, 'train', 'images' + '_til')
-    # im_list_train_tile = []
-    # for f in sorted([z for z in os.listdir(dtmp) if z.endswith('.png')]):
-    #     im_list_train_tile.append(os.path.join(dtmp, f))
-        
-    # normal valid images
-    dtmp = os.path.join(out_dir_root, 'valid', 'images' + '')
-    im_list_valid = []
-    for f in sorted([z for z in os.listdir(dtmp) if z.endswith('.png')]):
-        im_list_valid.append(os.path.join(dtmp, f))
-    # # tile valid images
-    # dtmp = os.path.join(out_dir_root, 'valid', 'images' + '_tile')
-    # im_list_valid_tile = []
-    # for f in sorted([z for z in os.listdir(dtmp) if z.endswith('.png')]):
-    #     im_list_valid_tile.append(os.path.join(dtmp, f))
-    # # yuge valid images
-    # dtmp = os.path.join(out_dir_root, 'valid', 'images' + '_yuge')
-    # im_list_valid_yuge = []
-    # for f in sorted([z for z in os.listdir(dtmp) if z.endswith('.png')]):
-    #     im_list_valid_yuge.append(os.path.join(dtmp, f))
-
-    # combine in different csvs
-    # training
-    outpath_tmp = os.path.join(out_dir_root, 'train.txt')
-    list_tmp = im_list_train
-    df_tmp = pd.DataFrame({'image': list_tmp})
-    df_tmp.to_csv(outpath_tmp, header=False, index=False)
-    # # training + tile
-    # outpath_tmp = os.path.join(out_dir_root, 'train+tile.txt')
-    # list_tmp = im_list_train + im_list_train_tile
-    # df_tmp = pd.DataFrame({'image': list_tmp})
-    # df_tmp.to_csv(outpath_tmp, header=False, index=False)
-    
-    # valid
-    outpath_tmp = os.path.join(out_dir_root, 'valid.txt')
-    list_tmp = im_list_valid
-    df_tmp = pd.DataFrame({'image': list_tmp})
-    df_tmp.to_csv(outpath_tmp, header=False, index=False)
-    # # valid + tile
-    # outpath_tmp = os.path.join(out_dir_root, 'valid+tile.txt')
-    # list_tmp = im_list_valid + im_list_valid_tile
-    # df_tmp = pd.DataFrame({'image': list_tmp})
-    # df_tmp.to_csv(outpath_tmp, header=False, index=False)
-    # # valid + tile + yuge
-    # outpath_tmp = os.path.join(out_dir_root, 'valid+tile+yuge.txt')
-    # list_tmp = im_list_valid + im_list_valid_tile + im_list_valid_yuge
-    # df_tmp = pd.DataFrame({'image': list_tmp})
-    # df_tmp.to_csv(outpath_tmp, header=False, index=False)
-
-    # plot yolo data, to check labels, also copy .txt files to image folder
-    print("Plot training bboxes")
-    max_plots = 20
-    shuffle = False
-    for im_dir_tmp in [
-        os.path.join(out_dir_root, 'train', 'images' + ''),
-        # os.path.join(out_dir_root, 'train', 'images' + '_tile'),
-        os.path.join(out_dir_root, 'valid', 'images' + ''),
-        # os.path.join(out_dir_root, 'valid', 'images' + '_tile'),
-        # os.path.join(out_dir_root, 'valid', 'images' + '_yuge')
-        ]:
-        label_dir_tmp = im_dir_tmp.replace('images', 'labels')
-        suff = im_dir_tmp.split('images')[-1]
-        sample_label_vis_dir = os.path.join(os.path.dirname(im_dir_tmp), 'sample_label_vis_dir' + suff)
-        os.makedirs(sample_label_vis_dir, exist_ok=True)
-        print("Plotting sample yolo labels for:", im_dir_tmp)
-        print("  sample_label_vis_dir:", sample_label_vis_dir)
-        plot_training_bboxes(label_dir_tmp, im_dir_tmp, 
-                            sample_label_vis_dir=sample_label_vis_dir,
-                            ignore_augment=True,
-                            figsize=(10, 10), color=(0, 0, 255), thickness=2,
-                            max_plots=max_plots, ext='.png',
-                            verbose=False, show_plot=False, specific_labels=[],
-                            label_dic=[], output_width=60000, shuffle=shuffle)
-    
-        # for yolov5, labels need to be in the same folder as images for training, 
-        # so copy over
-        for f in os.listdir(label_dir_tmp):
-            if f.endswith('.txt'):
-                shutil.copy(os.path.join(label_dir_tmp, f), im_dir_tmp)
+    return
+###############################################################################
+def twinx_function(x, raw=False):
+    V = 3./x
+    if raw:
+        return V
+    else:
+        return ["%.1f" % z for z in V]
+    # return [z for z in V]
 
 
 ###############################################################################
+def piecewise_linear(x, x0, y0, k1, k2):
+    return np.piecewise(x,
+                        [x < x0],
+                        [lambda x:k1*x + y0-k1*x0, lambda x:k2*x + y0-k2*x0])
+
+
 ###############################################################################
-if __name__ == "__main__":
-    main()
+def _file_len(fname):
+    '''Return length of file'''
+    try:
+        with open(fname) as f:
+            for i, l in enumerate(f):
+                pass
+        return i + 1
+    except:
+        return 0
+
+
+###############################################################################
+def _run_cmd(cmd):
+    '''Write to stdout, etc,(incompatible with nohup)'''
+    p = Popen(cmd, stdout=PIPE, stderr=STDOUT, shell=True)
+    while True:
+        line = p.stdout.readline()
+        if not line:
+            break
+        print(line.replace('\n', ''))
+    return
+
+
+
+# https://github.com/CosmiQ/simrdwn/blob/master/simrdwn/data_prep/yolt_data_prep_funcs.py
+###############################################################################
+def convert(size, box):
+    '''Input = image size: (w,h), box: [x0, x1, y0, y1]
+    Return yolo coords: normalized (x, y, w, h)'''
+    dw = 1./size[0]
+    dh = 1./size[1]
+    xmid = (box[0] + box[1])/2.0
+    ymid = (box[2] + box[3])/2.0
+    w0 = box[1] - box[0]
+    h0 = box[3] - box[2]
+    x = xmid*dw
+    y = ymid*dh
+    w = w0*dw
+    h = h0*dh
+    return (x,y,w,h)
+ 
+ 
+# https://github.com/CosmiQ/simrdwn/blob/master/simrdwn/data_prep/yolt_data_prep_funcs.py
+###############################################################################
+def convert_reverse(size, box):
+    '''Back out pixel coords from yolo format
+    input = image_size (w,h), 
+        box = [x,y,w,h]'''
+    x, y, w, h = box
+    dw = 1./size[0]
+    dh = 1./size[1]
+
+    w0 = w/dw
+    h0 = h/dh
+    xmid = x/dw
+    ymid = y/dh
+
+    x0, x1 = xmid - w0/2., xmid + w0/2.
+    y0, y1 = ymid - h0/2., ymid + h0/2.
+
+    return [x0, x1, y0, y1]
+
+###############################################################################
+
+    
+    
+###############################################################################
+def slice_im_plus_df(image_path, out_name, out_dir_images, 
+             label_df=None, 
+             min_obj_frac=0.7, 
+             geometry_col='geometry_poly_pixel', 
+             category_col='Category',
+             out_dir_geojson=None,
+             sliceHeight=416, sliceWidth=416,
+             overlap=0.1, slice_sep='|', pad=0,
+             skip_highly_overlapped_tiles=False,
+             overwrite=False,
+             keep_empty_geojsons=False,
+             out_ext='.png', verbose=False):
+
+    """
+    Slice a large image into smaller windows, and also return boxes labels 
+             withing the window (label_df is a geojson of labels)
+    Adapted from:
+         https://github.com/avanetten/simrdwn/blob/master/simrdwn/core/slice_im.py
+
+    Arguments
+    ---------
+    image_path : str
+        Location of image to slice
+    out_name : str
+        Root name of output files (coordinates will be appended to this)
+    out_dir_images : str
+        Output directory for images
+	label_df : dataframe
+		dataframe of labels
+    sliceHeight : int
+        Height of each slice.  Defaults to ``416``.
+    sliceWidth : int
+        Width of each slice.  Defaults to ``416``.
+    overlap : float
+        Fractional overlap of each window (e.g. an overlap of 0.2 for a window
+        of size 256 yields an overlap of 51 pixels).
+        Default to ``0.1``.
+    slice_sep : str
+        Character used to separate outname from coordinates in the saved
+        windows.  Defaults to ``|``
+    out_ext : str
+        Extension of saved images.  Defaults to ``.png``.
+    verbose : boolean
+        Switch to print relevant values to screen.  Defaults to ``False``
+
+    Returns
+    -------
+    None
+    """
+
+    if len(out_ext) == 0:
+        im_ext = '.' + image_path.split('.')[-1]
+    else:
+        im_ext = out_ext
+
+    t0 = time.time()
+    image = skimage.io.imread(image_path)  #, as_grey=False).astype(np.uint8)  # [::-1]
+    if verbose:
+        print("image.shape:", image.shape)
+    win_h, win_w = image.shape[:2]
+    win_size = sliceHeight*sliceWidth
+    dx = int((1. - overlap) * sliceWidth)
+    dy = int((1. - overlap) * sliceHeight)
+    
+    n_ims = 0
+    for y0 in range(0, image.shape[0], dy):
+        for x0 in range(0, image.shape[1], dx):
+            out_boxes_yolo = []
+            out_classes_yolo = []
+            n_ims += 1
+
+            if (n_ims % 100) == 0:
+                print(n_ims)
+
+            # make sure we don't have a tiny image on the edge
+            if y0+sliceHeight > image.shape[0]:
+                # skip if too much overlap (> 0.6)
+                if skip_highly_overlapped_tiles:
+                    if (y0+sliceHeight - image.shape[0]) > (0.6*sliceHeight):
+                        continue
+                    else:
+                        y = image.shape[0] - sliceHeight
+                else:
+                    y = image.shape[0] - sliceHeight
+            else:
+                y = y0
+            if x0+sliceWidth > image.shape[1]:
+                # skip if too much overlap (> 0.6)
+                if skip_highly_overlapped_tiles:
+                    if (x0+sliceWidth - image.shape[1]) > (0.6*sliceWidth):
+                        continue
+                    else:
+                        x = image.shape[1] - sliceWidth
+                else:
+                    x = image.shape[1] - sliceWidth
+            else:
+                x = x0
+
+            xmin, xmax, ymin, ymax = x, x+sliceWidth, y, y+sliceHeight
+            
+            # extract labels from window
+            if label_df is not None:
+                # get geom of window (see prep_train.get_window_geoms())
+                win_p1 = shapely.geometry.Point(xmin, ymin)
+                win_p2 = shapely.geometry.Point(xmax, ymin)
+                win_p3 = shapely.geometry.Point(xmax, ymax)
+                win_p4 = shapely.geometry.Point(xmin, ymax)
+                pointList = [win_p1, win_p2, win_p3, win_p4, win_p1]
+                geom_window = shapely.geometry.Polygon([[p.x, p.y] for p in pointList])
+            
+                # get objects within the window
+                # obj_list has form: [[index_nest, cat_nest, x0_obj, y0_obj, x1_obj, y1_obj], ...]
+                obj_list = get_objs_in_window(label_df, geom_window, 
+                        min_obj_frac=min_obj_frac, 
+                        geometry_col=geometry_col, category_col=category_col,
+                        use_box_geom=True, verbose=False)
+
+                # create output gdf, geojson
+                outpath_geojson = os.path.join(
+                        out_dir_geojson,
+                        out_name + slice_sep + str(y) + '_' + str(x) + '_'
+                        + str(sliceHeight) + '_' + str(sliceWidth)
+                        + '_' + str(pad) + '_' + str(win_w) + '_' + str(win_h)
+                        + '.geojson')
+                if len(obj_list) == 0:
+                    if keep_empty_geojsons:
+                        if out_dir_geojson:
+                            # print("Empty dataframe, writing empty gdf", output_path)
+                            open(outpath_geojson, 'a').close()
+                else:
+                    index_l, cat_l, geom_l = [], [], []
+                    for row in obj_list:
+                        index_nest, cat_nest, xmin_tmp, ymin_tmp, xmax_tmp, ymax_tmp = row
+                        tmp_p1 = shapely.geometry.Point(xmin_tmp, ymin_tmp)
+                        tmp_p2 = shapely.geometry.Point(xmax_tmp, ymin_tmp)
+                        tmp_p3 = shapely.geometry.Point(xmax_tmp, ymax_tmp)
+                        tmp_p4 = shapely.geometry.Point(xmin_tmp, ymax_tmp)
+                        pointList = [tmp_p1, tmp_p2, tmp_p3, tmp_p4, tmp_p1]
+                        geom_tmp = shapely.geometry.Polygon([[p.x, p.y] for p in pointList])
+                        index_l.append(index_nest)
+                        cat_l.append(cat_nest)
+                        geom_l.append(geom_tmp)
+                    # construct dataframe
+                    dict_tmp = {'index_nest': index_l, category_col: cat_l, geometry_col: geom_l}
+                    gdf_tmp = gpd.GeoDataFrame(dict_tmp)
+                    # print("gdf_tmp:", gdf_tmp)
+                    # save to geojson, if desired
+                    if out_dir_geojson:
+                        gdf_tmp.to_file(outpath_geojson, driver='GeoJSON')
+
+            # extract image
+            window_c = image[y:y + sliceHeight, x:x + sliceWidth]
+            outpath = os.path.join(
+                out_dir_images,
+                out_name + slice_sep + str(y) + '_' + str(x) + '_'
+                + str(sliceHeight) + '_' + str(sliceWidth)
+                + '_' + str(pad) + '_' + str(win_w) + '_' + str(win_h)
+                + im_ext)
+            if not os.path.exists(outpath):
+                skimage.io.imsave(outpath, window_c, check_contrast=False)
+            elif overwrite:
+                skimage.io.imsave(outpath, window_c, check_contrast=False)
+            else:
+                if verbose:
+                    print("outpath {} exists, skipping".format(outpath))
+                                                                                                 
+    print("Num slices:", n_ims,
+          "sliceHeight", sliceHeight, "sliceWidth", sliceWidth)
+    print("Time to slice", image_path, time.time()-t0, "seconds")
+    return
+

@@ -22,7 +22,7 @@ YOLTv5 is built to execute on a GPU-enabled machine.
 
 	# update with geo packages
 	conda install -c conda-forge gdal
-	conda install -c conda-forge osmnx=0.12 
+	conda install -c conda-forge osmnx==0.12 
 	conda install  -c conda-forge scikit-image
 	conda install  -c conda-forge statsmodels
 	pip install torchsummary
@@ -36,8 +36,7 @@ ___
 
 Training preparation is accomplished via [prep_train.py](https://github.com/avanetten/yoltv5/blob/main/yoltv5/prep_train.py).  To train a model, run:
 
-	cd /yoltv5
-    python yolov5/train.py --img 640 --batch 16 --epochs 100 --data yoltv5_train_vehicles_8cat.yaml --weights yolov5l.pt
+    python yoltv5/yolov5/train.py --img 512 --batch 16 --epochs 100 --data configs/yoltv5_rareplanes_train_roles.yaml --weights yolov5l.pt
 
 ___
 

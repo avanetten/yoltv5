@@ -1,0 +1,9 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: /home/sait/yoltv5/wdata/  # dataset root dir
+train: train/images/  # train images (relative to 'path')
+val: valid/images/  # val images (relative to 'path')
+test:  # test images (optional)
+
+# Classes
+nc: 7  # number of classes
+names: ['Small Civil Transport/Utility', 'Medium Civil Transport/Utility', 'Large Civil Transport/Utility', 'Military Transport/Utility/AWAC', 'Military Bomber', 'Military Fighter/Interceptor/Attack', 'Military Trainer']
