@@ -49,6 +49,6 @@ Simply edit [yoltv5_test_vehicles_8cat.yaml](https://github.com/avanetten/yoltv5
 	./test.sh ../configs/yoltv5_test_vehicles_8cat.yaml
 
 
-Outputs will look something like the figure below:
+Outputs will look something like the figure below (cars=green, trucks=red, buses=blue):
 
 ![Alt text](/results/__examples/khartoum_example0.jpg?raw=true "")
