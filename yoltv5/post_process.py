@@ -24,7 +24,7 @@ import cv2
 import os
 
 # import yoltv5 funcs
-import utils
+import utils_2
 from prep_train import convert_poly_coords
 # from scorer import score_one
 
@@ -1389,7 +1389,7 @@ def execute(pred_dir='/root/yoltv5/results/',
                 prob = float(data_frac[5])
                 # get pixel coords of yolo coords
                 yolt_box = data_frac[1:5]
-                pix_coords_float = utils.convert_reverse((im_w, im_h), yolt_box)
+                pix_coords_float = utils_2.convert_reverse((im_w, im_h), yolt_box)
                 [x0, x1, y0, y1] = pix_coords_float
                 # # convert to int?
                 # [x0, x1, y0, y1] = [int(round(b, 2)) for b in pix_coords_float]
