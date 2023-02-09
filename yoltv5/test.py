@@ -50,8 +50,8 @@ sys.path.append(yolt_src_path)
 import prep_train
 import tile_ims_labels
 import post_process
-import eval
-import eval_errors
+#import eval
+#import eval_errors
 
 # check if output already exists
 results_dir = os.path.join(yolt_src_path, 'yolov5/runs/detect', config.outname_infer)
